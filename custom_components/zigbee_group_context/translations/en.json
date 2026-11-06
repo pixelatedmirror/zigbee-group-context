@@ -1,0 +1,29 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Zigbee Group Context Propagator",
+        "description": "Configure dynamic context propagation for Zigbee groups.",
+        "data": {
+          "ttl": "Correlation Time-to-Live (seconds)",
+          "mqtt_base_topic": "Zigbee2MQTT Base MQTT Topic"
+        }
+      }
+    },
+    "abort": {
+      "single_instance_allowed": "Only a single instance of Zigbee Group Context Propagator is necessary."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Configure Zigbee Group Context Propagator",
+        "description": "Tune correlation TTL window and MQTT parameters.",
+        "data": {
+          "ttl": "Correlation Time-to-Live (seconds)",
+          "mqtt_base_topic": "Zigbee2MQTT Base MQTT Topic"
+        }
+      }
+    }
+  }
+}
