@@ -1,0 +1,12 @@
+{
+  "domain": "zigbee_group_context",
+  "name": "Zigbee Group Context Propagator",
+  "codeowners": ["@nathan"],
+  "config_flow": true,
+  "dependencies": ["recorder"],
+  "documentation": "https://github.com/nathan/zigbee_group_context",
+  "integration_type": "service",
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/nathan/zigbee_group_context/issues",
+  "version": "1.0.0"
+}
