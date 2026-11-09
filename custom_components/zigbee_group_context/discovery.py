@@ -36,6 +36,44 @@ def _get_entries_for_device(entity_reg: er.EntityRegistry, device_id: str) -> li
         return []
 
 
+def _get_device_by_identifiers(
+    device_reg: dr.DeviceRegistry, identifiers: set[tuple[str, str]]
+) -> dr.DeviceEntry | None:
+    """Safely get device entry by identifier set without triggering deprecation warnings."""
+    if not identifiers:
+        return None
+
+    # 1. Primary path: Direct index lookup on device_reg.devices without deprecation checks
+    if hasattr(device_reg, "devices"):
+        devices = device_reg.devices
+        if hasattr(devices, "get_entry") and callable(devices.get_entry):
+            try:
+                entry = devices.get_entry(identifiers=identifiers)
+                if entry is not None:
+                    return entry
+            except Exception:
+                pass
+
+        # If devices is a dict or iterable collection (e.g. in test mocks)
+        try:
+            device_iterable = devices.values() if hasattr(devices, "values") and callable(devices.values) else devices
+            for dev in device_iterable:
+                dev_idents = getattr(dev, "identifiers", set())
+                if identifiers & dev_idents:
+                    return dev
+        except Exception:
+            pass
+
+    # 2. Fallback: call async_get_device with the full set at once (avoids looping)
+    if hasattr(device_reg, "async_get_device") and callable(device_reg.async_get_device):
+        try:
+            return device_reg.async_get_device(identifiers=identifiers)
+        except Exception:
+            pass
+
+    return None
+
+
 class ZigbeeGroupDiscovery:
     """Manages dynamic group discovery across Zigbee2MQTT, ZHA, and native HA groups."""
 
@@ -53,6 +91,7 @@ class ZigbeeGroupDiscovery:
         self._member_to_groups: dict[str, set[str]] = {}
         self._unsubs: list[CALLBACK_TYPE] = []
         self._z2m_raw_groups: list[dict[str, Any]] = []
+        self._debounce_unsub: CALLBACK_TYPE | None = None
 
     @property
     def all_groups(self) -> dict[str, set[str]]:
@@ -133,6 +172,13 @@ class ZigbeeGroupDiscovery:
     async def async_stop(self) -> None:
         """Stop discovery and unsubscribe all listeners."""
         _LOGGER.debug("Stopping Zigbee group discovery")
+        if self._debounce_unsub is not None:
+            try:
+                self._debounce_unsub()
+            except Exception as err:
+                _LOGGER.debug("Error canceling debounce timer: %s", err)
+            self._debounce_unsub = None
+
         for unsub in self._unsubs:
             try:
                 unsub()
@@ -261,7 +307,7 @@ class ZigbeeGroupDiscovery:
             if ieee:
                 clean_ieee = ieee.lower().replace("0x", "")
                 full_ieee = f"0x{clean_ieee}"
-                identifiers_to_try = [
+                identifiers_to_try = {
                     ("mqtt", f"zigbee2mqtt_{full_ieee}"),
                     ("mqtt", f"zigbee2mqtt_{clean_ieee}"),
                     ("mqtt", f"{self.mqtt_base_topic}_{full_ieee}"),
@@ -270,11 +316,10 @@ class ZigbeeGroupDiscovery:
                     ("zigbee2mqtt", clean_ieee),
                     ("mqtt", full_ieee),
                     ("mqtt", clean_ieee),
-                ]
-                for ident in identifiers_to_try:
-                    dev = device_reg.async_get_device(identifiers={ident})
-                    if dev and dev not in matched_devices:
-                        matched_devices.append(dev)
+                }
+                dev = _get_device_by_identifiers(device_reg, identifiers_to_try)
+                if dev and dev not in matched_devices:
+                    matched_devices.append(dev)
 
             # Also search by friendly name in device registry if not yet matched
             if not matched_devices and member_friendly_name:
@@ -453,18 +498,17 @@ class ZigbeeGroupDiscovery:
                             resolved.add(ha_eid.lower())
 
             # 2. Check Device Registry for identifier ("zha", ieee_str)
-            identifiers_to_try = [
+            identifiers_to_try = {
                 ("zha", ieee_str),
                 ("zha", ieee_str.upper()),
                 ("zha", str(ieee)),
-            ]
-            for ident in identifiers_to_try:
-                dev = device_reg.async_get_device(identifiers={ident})
-                if dev:
-                    entries = _get_entries_for_device(entity_reg, dev.id)
-                    for entry in entries:
-                        if entry.domain in SUPPORTED_MEMBER_DOMAINS and not entry.disabled_by:
-                            resolved.add(entry.entity_id.lower())
+            }
+            dev = _get_device_by_identifiers(device_reg, identifiers_to_try)
+            if dev:
+                entries = _get_entries_for_device(entity_reg, dev.id)
+                for entry in entries:
+                    if entry.domain in SUPPORTED_MEMBER_DOMAINS and not entry.disabled_by:
+                        resolved.add(entry.entity_id.lower())
 
         return resolved
 
@@ -530,9 +574,41 @@ class ZigbeeGroupDiscovery:
     # -------------------------------------------------------------------------
 
     @callback
+    def _schedule_debounced_refresh(self, delay: float = 1.5) -> None:
+        """Schedule a debounced re-evaluation of Zigbee groups."""
+        if self._debounce_unsub is not None:
+            try:
+                self._debounce_unsub()
+            except Exception:
+                pass
+            self._debounce_unsub = None
+
+        @callback
+        def _debounced_refresh(_now: Any = None) -> None:
+            self._debounce_unsub = None
+            _LOGGER.debug(
+                "Entity registry update burst settled, re-evaluating Zigbee groups"
+            )
+            self._async_discover_z2m_cached()
+            self._async_setup_zha()
+            self._async_discover_native_ha_groups()
+
+        try:
+            from homeassistant.helpers.event import async_call_later
+            self._debounce_unsub = async_call_later(
+                self.hass, delay, _debounced_refresh
+            )
+        except Exception:
+            _debounced_refresh()
+
+    @callback
     def _handle_entity_registry_updated(self, event: Any) -> None:
-        """Re-resolve groups when the entity registry changes."""
-        _LOGGER.debug("Entity registry updated, re-evaluating Zigbee groups")
-        self._async_discover_z2m_cached()
-        self._async_setup_zha()
-        self._async_discover_native_ha_groups()
+        """Handle entity registry updates with domain filtering and debouncing."""
+        if hasattr(event, "data") and isinstance(event.data, dict):
+            entity_id = event.data.get("entity_id")
+            if isinstance(entity_id, str) and "." in entity_id:
+                domain = entity_id.split(".", 1)[0]
+                if domain not in SUPPORTED_MEMBER_DOMAINS and domain != "group":
+                    return
+
+        self._schedule_debounced_refresh()
