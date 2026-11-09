@@ -166,3 +166,83 @@ def test_native_ha_groups_discovery():
     assert discovery.is_group("light.hallway_group")
     assert discovery.get_members("light.hallway_group") == {"light.hallway_1", "light.hallway_2"}
     assert not discovery.is_group("light.standalone_lamp")
+
+
+def test_get_device_by_identifiers_direct_lookup():
+    """Test _get_device_by_identifiers via devices.get_entry directly."""
+    from custom_components.zigbee_group_context.discovery import _get_device_by_identifiers
+
+    mock_dev_reg = MagicMock()
+    mock_dev = MagicMock(id="dev_42")
+
+    # devices.get_entry returns device
+    mock_dev_reg.devices.get_entry.return_value = mock_dev
+
+    ident_set = {("mqtt", "zigbee2mqtt_0x1234"), ("mqtt", "zigbee2mqtt_1234")}
+    result = _get_device_by_identifiers(mock_dev_reg, ident_set)
+
+    assert result is mock_dev
+    mock_dev_reg.devices.get_entry.assert_called_once_with(identifiers=ident_set)
+    # async_get_device should NEVER be called when get_entry succeeds
+    mock_dev_reg.async_get_device.assert_not_called()
+
+
+def test_handle_entity_registry_updated_domain_filtering():
+    """Test that entity registry updates for unrelated domains are ignored."""
+    hass = MagicMock()
+    discovery = ZigbeeGroupDiscovery(hass=hass)
+    discovery._schedule_debounced_refresh = MagicMock()
+
+    # Sensor update -> should be ignored
+    event_sensor = MagicMock(data={"entity_id": "sensor.cpu_temperature", "action": "update"})
+    discovery._handle_entity_registry_updated(event_sensor)
+    discovery._schedule_debounced_refresh.assert_not_called()
+
+    # Binary sensor update -> should be ignored
+    event_binary = MagicMock(data={"entity_id": "binary_sensor.front_door", "action": "update"})
+    discovery._handle_entity_registry_updated(event_binary)
+    discovery._schedule_debounced_refresh.assert_not_called()
+
+    # Weather update -> should be ignored
+    event_weather = MagicMock(data={"entity_id": "weather.home", "action": "update"})
+    discovery._handle_entity_registry_updated(event_weather)
+    discovery._schedule_debounced_refresh.assert_not_called()
+
+    # Light update -> should trigger debounced refresh
+    event_light = MagicMock(data={"entity_id": "light.kitchen_chandelier", "action": "update"})
+    discovery._handle_entity_registry_updated(event_light)
+    discovery._schedule_debounced_refresh.assert_called_once()
+
+
+def test_debounced_refresh_collapses_burst():
+    """Test that multiple rapid updates within debounce window collapse into a single refresh."""
+    hass = MagicMock()
+    discovery = ZigbeeGroupDiscovery(hass=hass)
+
+    refresh_mock = MagicMock()
+    discovery._async_discover_z2m_cached = refresh_mock
+    discovery._async_setup_zha = MagicMock()
+    discovery._async_discover_native_ha_groups = MagicMock()
+
+    # Fire 5 updates
+    callbacks = []
+
+    def mock_call_later(hass_arg, delay, action):
+        callbacks.append(action)
+        return MagicMock()
+
+    with patch("homeassistant.helpers.event.async_call_later", side_effect=mock_call_later):
+        for i in range(5):
+            event = MagicMock(data={"entity_id": f"light.spot_{i}", "action": "update"})
+            discovery._handle_entity_registry_updated(event)
+
+    # 5 call_later calls were scheduled (each cancelling the previous)
+    assert len(callbacks) == 5
+    # The actual discovery methods haven't executed yet
+    refresh_mock.assert_not_called()
+
+    # Now execute the latest callback (simulating timer firing after activity settles)
+    callbacks[-1]()
+
+    # Re-evaluation should run exactly once
+    assert refresh_mock.call_count == 1
